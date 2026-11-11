@@ -276,6 +276,26 @@ class StateVector:
             - torch.square(self.state[:, :, :, 1].abs())
         )
 
+    def measure_bloch(self) -> torch.Tensor:
+        """
+        Measure the Bloch vector of the state.
+
+        For |ψ⟩ = a|0⟩ + b|1⟩, return (r_x, r_y, r_z) with
+        r_x = 2 Re(a* b), r_y = 2 Im(a* b), r_z = |a|^2 - |b|^2, computed from
+        the real and imaginary parts of a and b. ``.abs()`` is not used: its
+        gradient is undefined at 0.
+
+        return: torch.Tensor, shape: (batch_size, out_dim, in_dim, 3), in the
+                real dtype of the state (complex64 → float32, complex128 → float64)
+        """
+        a = self.state[..., 0]
+        b = self.state[..., 1]
+        a_r, a_i, b_r, b_i = a.real, a.imag, b.real, b.imag
+        r_x = 2 * (a_r * b_r + a_i * b_i)
+        r_y = 2 * (a_r * b_i - a_i * b_r)
+        r_z = a_r * a_r + a_i * a_i - b_r * b_r - b_i * b_i
+        return torch.stack([r_x, r_y, r_z], dim=-1)
+
     def measure_x(self, fast_measure: bool = True) -> torch.Tensor:
         """
         Measure the state vector in the X basis.

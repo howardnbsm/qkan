@@ -23,6 +23,8 @@ try:
     from .cute_ops import (
         _CUTE_KERNELS_AVAILABLE,
         cute_pz_backward,
+        cute_pz_bloch_backward,
+        cute_pz_bloch_forward,
         cute_pz_forward,
         cute_real_backward,
         cute_real_forward,
@@ -159,6 +161,49 @@ class _CuTeFunction(torch.autograd.Function):
         )
 
 
+class _CuTePzBlochFunction(torch.autograd.Function):
+    """
+    Custom autograd function for the pz-encoding Bloch vectors: CuTe CUDA
+    forward, (batch, out_dim, in_dim, 3), and backward with forward
+    recomputation. First order only, like _CuTeFunction: the backward is
+    not itself differentiable.
+    """
+
+    @staticmethod
+    def forward(ctx, x, theta, preacts_w, preacts_b, preacts_trainable, c_dtype):
+        ctx.save_for_backward(x, theta, preacts_w, preacts_b)
+        ctx.preacts_trainable = preacts_trainable
+        ctx.c_dtype = c_dtype
+        return cute_pz_bloch_forward(
+            x, theta, preacts_w, preacts_b, preacts_trainable, c_dtype=c_dtype
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, theta, preacts_w, preacts_b = ctx.saved_tensors
+        grad_x, grad_theta, grad_pw, grad_pb = cute_pz_bloch_backward(
+            x,
+            theta,
+            preacts_w,
+            preacts_b,
+            grad_output,
+            ctx.preacts_trainable,
+            c_dtype=ctx.c_dtype,
+        )
+        if ctx.c_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            grad_x, grad_theta, grad_pw, grad_pb = _cast_grads_to_dtype(
+                grad_x, grad_theta, grad_pw, grad_pb, x.dtype
+            )
+        return (
+            grad_x,
+            grad_theta,
+            grad_pw,
+            grad_pb,
+            None,  # preacts_trainable
+            None,  # c_dtype
+        )
+
+
 def cute_exact_solver(
     x: torch.Tensor,
     theta: torch.Tensor,
@@ -179,10 +224,13 @@ def cute_exact_solver(
       - Warp-shuffle reductions for gradient accumulation
 
     Args:
-        Same as torch_exact_solver.
+        Same as torch_exact_solver, including ``bloch_measure`` (pz_encoding
+        only).
 
     Returns:
-        torch.Tensor, shape: (batch_size, out_dim, in_dim)
+        torch.Tensor, shape: (batch_size, G, in_dim), or with
+        bloch_measure=True (batch_size, G, in_dim, 3), G = theta.shape[0]
+        after broadcasting (see torch_exact_solver)
     """
     if not _CUTE_AVAILABLE:
         raise ImportError(
@@ -195,7 +243,14 @@ def cute_exact_solver(
     fast_measure = kwargs.get("fast_measure", True)
     out_dim: int = kwargs.get("out_dim", x.shape[1])
     c_dtype = kwargs.get("dtype", torch.complex64)
+    bloch_measure = kwargs.get("bloch_measure", False)
     batch, in_dim = x.shape
+
+    if bloch_measure and ansatz not in ("pz_encoding", "pz"):
+        raise NotImplementedError(
+            f"bloch_measure=True is only implemented for ansatz 'pz_encoding' "
+            f"or 'pz', got {ansatz!r}"
+        )
 
     # Fallback for unsupported ansatzes
     if ansatz not in _SUPPORTED_CUTE_ANSATZES:
@@ -236,6 +291,15 @@ def cute_exact_solver(
             needs_grad = (
                 needs_grad or preacts_weight.requires_grad or preacts_bias.requires_grad
             )
+
+    if bloch_measure:
+        if needs_grad:
+            return _CuTePzBlochFunction.apply(
+                x, theta, preacts_weight, preacts_bias, preacts_trainable, c_dtype
+            )
+        return cute_pz_bloch_forward(
+            x, theta, preacts_weight, preacts_bias, preacts_trainable, c_dtype=c_dtype
+        )
 
     if needs_grad:
         return _CuTeFunction.apply(

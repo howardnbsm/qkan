@@ -650,14 +650,168 @@ class QKANLayer(nn.Module):
     def x0(self, x: torch.Tensor):
         self._x0 = None
 
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self, x: torch.Tensor, observable: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args
+        ----
+            x : torch.Tensor
+                shape: (batch_size, in_dim)
+            observable : Optional[torch.Tensor]
+                Per-edge observable O_ji = sum_p c[4 * i + p, j] P_p in the
+                Pauli basis P = (I, X, Y, Z): shape (4 * in_dim, out_dim),
+                shared by the batch, or (batch_size, 4 * in_dim, out_dim), one
+                per sample, on the device of ``x``. Any real dtype (converted
+                to ``p_dtype``) and any strides. The edge readout
+                Tr(rho O_ji) replaces the fixed Z measurement, so the output
+                is differentiable w.r.t. ``observable`` and ``fast_measure``
+                has no effect. Only for solver "exact" / "cute" with ansatz
+                "pz_encoding" / "pz". Default None: the fixed Z measurement.
+                As in Z mode, solver "cute" gives first-order gradients only
+                (``create_graph=True`` gets no second-order circuit terms),
+                and after ``eval()`` the opt-in fused epilogue records no
+                autograd graph.
+
+        Returns
+        -------
+            torch.Tensor
+                shape: (batch_size, out_dim)
+        """
         # Two-route dispatch: eval (cached) vs train (live). The eval route
         # is the inference hot path and uses pre-folded weights + cached
         # natural-view solver inputs. The train route reads parameters
         # directly so autograd records grads on the live storage.
+        if observable is None:
+            if self._eff_pw is not None:
+                return self._forward_eval(x)
+            return self._forward_train(x)
+        # Validate before the routes run batch norm (which updates its running
+        # statistics in train mode) and the base activation, so a rejected
+        # call has no side effects.
+        self._check_observable(x, observable)
         if self._eff_pw is not None:
-            return self._forward_eval(x)
-        return self._forward_train(x)
+            return self._forward_eval(x, observable)
+        return self._forward_train(x, observable)
+
+    def forward_bloch(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Bloch vectors of the layer's circuits, for building observable keys.
+
+        Args
+        ----
+            x : torch.Tensor
+                shape: (batch_size, in_dim); batch norm is applied first when
+                ``is_batchnorm``, as in ``forward``
+
+        Returns
+        -------
+            torch.Tensor
+                shape: (batch_size, G, in_dim, 3), in ``p_dtype``: the Bloch
+                vector (r_x, r_y, r_z) of circuit g on input i, where
+                G = theta.shape[0] after the solver's broadcast: 1 for
+                group=in_dim or (1, in_dim); out_dim for group=-1 and for an
+                int group other than in_dim (whose circuits are then repeated
+                for every output). Differentiable w.r.t. ``x``, ``theta`` and
+                the preacts when trainable (first order only on solver
+                "cute"); ``fast_measure`` has no effect. Only for solver
+                "exact" / "cute" with ansatz "pz_encoding" / "pz".
+        """
+        assert x.shape[1] == self.in_dim, "Invalid input dimension"
+        self._check_bloch_support()
+        if self.is_batchnorm:
+            x = self.bn(x)
+        return self._run_solver(
+            x,
+            self._theta_natural_v,
+            self._preacts_w_natural_v,
+            self._preacts_b_natural_v,
+            bloch_measure=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Trainable observable (Bloch readout)
+    # ------------------------------------------------------------------
+    def _check_bloch_support(self) -> None:
+        """Raise NotImplementedError unless the solver can return Bloch vectors."""
+        if not (
+            isinstance(self.solver, str)
+            and self.solver in ("exact", "cute")
+            and isinstance(self.ansatz, str)
+            and self.ansatz in ("pz_encoding", "pz")
+        ):
+            raise NotImplementedError(
+                "observable and forward_bloch need solver 'exact' or 'cute' and "
+                "ansatz 'pz_encoding' or 'pz', got "
+                f"solver={self.solver!r}, ansatz={self.ansatz!r}"
+            )
+
+    def _check_observable(self, x: torch.Tensor, observable: torch.Tensor) -> None:
+        """Validate ``observable`` for ``forward(x, observable)`` (see there)."""
+        self._check_bloch_support()
+        shared = (4 * self.in_dim, self.out_dim)
+        per_sample = (x.shape[0], *shared)
+        if tuple(observable.shape) not in (shared, per_sample):
+            raise ValueError(
+                f"observable must have shape {shared} (shared) or {per_sample} "
+                f"(per sample), got {tuple(observable.shape)}"
+            )
+        if observable.is_complex():
+            raise ValueError(
+                "observable holds real Pauli coefficients, got dtype "
+                f"{observable.dtype}"
+            )
+        if observable.device != x.device:
+            raise ValueError(
+                f"observable must be on {x.device} (the device of x), got "
+                f"{observable.device}"
+            )
+
+    def _observable_postacts(
+        self, x: torch.Tensor, observable: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Edge readouts phi[b, j, i] = sum_p c[4 * i + p, j] * k[b, g(j), i, p],
+        with k = (1, r_x, r_y, r_z) from the Bloch solver output, c =
+        ``observable`` (shared) or ``observable[b]`` (per sample), and
+        g(j) = 0 if G == 1 else j.
+
+        Args
+        ----
+            x : torch.Tensor
+                shape: (batch_size, in_dim), after batch norm
+            observable : torch.Tensor
+                shape: (4 * in_dim, out_dim) or (batch_size, 4 * in_dim, out_dim)
+
+        Returns
+        -------
+            torch.Tensor
+                shape: (batch_size, out_dim, in_dim), in ``p_dtype``
+        """
+        self._check_observable(x, observable)
+        r = self._run_solver(
+            x,
+            self._theta_natural_v,
+            self._preacts_w_natural_v,
+            self._preacts_b_natural_v,
+            bloch_measure=True,
+        )  # (batch_size, G, in_dim, 3)
+        # (..., 4I, O) -> (..., I, 4, O): row 4 * i + p holds Pauli p of input i.
+        c = observable.to(self.p_dtype)
+        c = c.reshape(*c.shape[:-2], self.in_dim, 4, self.out_dim)
+        # Keep the readout in p_dtype under autocast, as the Z-mode postacts
+        # are; einsum would otherwise run in the autocast dtype.
+        with torch.autocast(device_type=r.device.type, enabled=False):
+            if r.shape[1] == 1:
+                # One circuit per input, read by every output j: contract
+                # k = (1, r_x, r_y, r_z) with c over p as a batched matmul.
+                k = torch.cat([torch.ones_like(r[:, 0, :, :1]), r[:, 0]], dim=-1)
+                c_idx = "ipj" if c.dim() == 3 else "bipj"
+                return torch.einsum(f"{c_idx},bip->bji", c, k)  # k: (B, I, 4)
+            # One circuit per edge (G == out_dim): an elementwise product is
+            # several times faster here than einsum's batched 1x4 @ 4x1 products.
+            c = c.movedim(-1, -3)  # (..., O, I, 4)
+            return (c[..., 1:] * r).sum(dim=-1) + c[..., 0]
 
     # ------------------------------------------------------------------
     # Solver dispatch (shared by both routes)
@@ -674,13 +828,38 @@ class QKANLayer(nn.Module):
             fn = self.solver
         self._solver_fn: Optional[Callable] = fn
 
+    def _registry_solver_kwargs(self, bloch_measure: bool = False) -> dict:
+        """``solver_kwargs`` for a registry-solver call.
+
+        The layer passes the solvers' ``bloch_measure`` keyword itself, only
+        from ``forward(x, observable)`` and ``forward_bloch``, so Z-mode calls
+        receive exactly the keywords they always have. A ``bloch_measure``
+        entry in ``solver_kwargs`` is dropped, as it had no effect before.
+        """
+        kwargs = self.solver_kwargs
+        if "bloch_measure" in kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k != "bloch_measure"}
+        if bloch_measure:
+            kwargs = {**kwargs, "bloch_measure": True}
+        return kwargs
+
     def _run_solver(
         self,
         x: torch.Tensor,
         theta_v: torch.Tensor,
         pw_v: torch.Tensor,
         pb_v: torch.Tensor,
+        bloch_measure: bool = False,
     ) -> torch.Tensor:
+        """Run the solver on the natural-rank views.
+
+        Returns (batch_size, G, in_dim) postacts, or with
+        ``bloch_measure=True`` (registry solvers "exact" and "cute" only) the
+        Bloch vectors, (batch_size, G, in_dim, 3). G = 1 for group=in_dim or
+        (1, in_dim), else out_dim; the epilogue broadcasts over out_dim.
+        Registry-solver output is cast to ``p_dtype``, qml output already is
+        in it, and a callable solver's output is returned as is.
+        """
         if self.solver == "qml":
             batch = x.shape[0]
             postacts = torch.zeros(
@@ -714,7 +893,7 @@ class QKANLayer(nn.Module):
                 out_dim=self.out_dim,
                 dtype=self.c_dtype,
                 checkpoint_reps=self.checkpoint_reps,
-                **self.solver_kwargs,
+                **self._registry_solver_kwargs(bloch_measure),
             )
             # The fused kernels write float32 or bf16 postacts whatever c_dtype
             # is, so cast on the actual dtype rather than on c_dtype.
@@ -732,18 +911,27 @@ class QKANLayer(nn.Module):
             **self.solver_kwargs,
         )
 
-    def _forward_eval(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference path — uses pre-folded weights + aliased solver inputs."""
+    def _forward_eval(
+        self, x: torch.Tensor, observable: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Inference path — uses pre-folded weights + aliased solver inputs.
+
+        ``observable``: None, (4 * in_dim, out_dim) or
+        (batch_size, 4 * in_dim, out_dim); see ``forward``.
+        """
         assert x.shape[1] == self.in_dim, "Invalid input dimension"
         if self.is_batchnorm:
             x = self.bn(x)
         base_input = self.base_activation(x)
-        postacts = self._run_solver(
-            x,
-            self._theta_natural_v,
-            self._preacts_w_natural_v,
-            self._preacts_b_natural_v,
-        )
+        if observable is None:
+            postacts = self._run_solver(
+                x,
+                self._theta_natural_v,
+                self._preacts_w_natural_v,
+                self._preacts_b_natural_v,
+            )
+        else:
+            postacts = self._observable_postacts(x, observable)
         eff_pw = self._eff_pw
         eff_base_w = self._eff_base_w
         assert eff_pw is not None and eff_base_w is not None
@@ -757,18 +945,27 @@ class QKANLayer(nn.Module):
         base = F.linear(base_input, eff_base_w, bias=self._bias_sum)
         return main.to(base.dtype) + base
 
-    def _forward_train(self, x: torch.Tensor) -> torch.Tensor:
-        """Training path — reads live params via aliased views, no eval cache."""
+    def _forward_train(
+        self, x: torch.Tensor, observable: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Training path — reads live params via aliased views, no eval cache.
+
+        ``observable``: None, (4 * in_dim, out_dim) or
+        (batch_size, 4 * in_dim, out_dim); see ``forward``.
+        """
         assert x.shape[1] == self.in_dim, "Invalid input dimension"
         if self.is_batchnorm:
             x = self.bn(x)
         base_input = self.base_activation(x)
-        postacts = self._run_solver(
-            x,
-            self._theta_natural_v,
-            self._preacts_w_natural_v,
-            self._preacts_b_natural_v,
-        )
+        if observable is None:
+            postacts = self._run_solver(
+                x,
+                self._theta_natural_v,
+                self._preacts_w_natural_v,
+                self._preacts_b_natural_v,
+            )
+        else:
+            postacts = self._observable_postacts(x, observable)
         pw_oi = self._pw_oi
         bw_oi = self._bw_oi
         if self._mask_is_identity:
@@ -896,7 +1093,7 @@ class QKANLayer(nn.Module):
                 fast_measure=self.fast_measure,
                 out_dim=self.out_dim,
                 dtype=self.c_dtype,
-                **self.solver_kwargs,
+                **self._registry_solver_kwargs(),
             ).to(self.p_dtype)
         else:
             raise NotImplementedError()

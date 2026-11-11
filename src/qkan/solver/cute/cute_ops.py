@@ -271,6 +271,56 @@ def cute_pz_backward(
     return tuple(results)
 
 
+def cute_pz_bloch_forward(
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    preacts_w: torch.Tensor,
+    preacts_b: torch.Tensor,
+    preacts_trainable: bool,
+    c_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """CuTe PZ-encoding forward returning Bloch vectors.
+
+    x: (batch, in_dim); theta: (out_dim, in_dim, reps + 1, 2); preacts_w,
+    preacts_b: (out_dim, in_dim, reps).  Returns (batch, out_dim, in_dim, 3):
+    (r_x, r_y, r_z) of every circuit, in float32 (bf16 for bf16/fp8 c_dtype).
+    """
+    ext = _get_ext()
+    return ext.pz_bloch_forward(
+        x, theta, preacts_w, preacts_b, preacts_trainable, _use_bf16(c_dtype)
+    )
+
+
+def cute_pz_bloch_backward(
+    x: torch.Tensor,
+    theta: torch.Tensor,
+    preacts_w: torch.Tensor,
+    preacts_b: torch.Tensor,
+    grad_output: torch.Tensor,
+    preacts_trainable: bool,
+    c_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Backward of :func:`cute_pz_bloch_forward`.
+
+    grad_output: (batch, out_dim, in_dim, 3).  Returns float32
+    (grad_x (batch, in_dim), grad_theta (theta's shape), grad_preacts_w or
+    None, grad_preacts_b or None); the preacts gradients are None unless
+    ``preacts_trainable``.
+    """
+    ext = _get_ext()
+    io_dtype = _resolve_io_dtype(c_dtype)
+    results = ext.pz_bloch_backward(
+        x.to(io_dtype).contiguous(),
+        theta.to(io_dtype).contiguous(),
+        preacts_w.to(io_dtype).contiguous() if preacts_trainable else preacts_w,
+        preacts_b.to(io_dtype).contiguous() if preacts_trainable else preacts_b,
+        grad_output.contiguous(),
+        preacts_trainable,
+        _state_bits(c_dtype),
+    )
+    return tuple(results)
+
+
 def cute_rpz_forward(
     x: torch.Tensor,
     theta: torch.Tensor,

@@ -110,7 +110,7 @@ __global__ void cute_pz_fwd_kernel(
     const IOT* __restrict__ pb_ptr,
     IOT* __restrict__ out_ptr,
     int batch_size, int in_dim, int out_dim, int reps,
-    bool preacts_trainable, bool fast_measure)
+    bool preacts_trainable, bool fast_measure, bool bloch)
 {
     extern __shared__ float smem[];
 
@@ -211,6 +211,19 @@ __global__ void cute_pz_fwd_kernel(
         r0 = nr0; i0 = ni0; r1 = nr1; i1 = ni1;
     }
 
+    if (bloch) {
+        // Bloch vector of a|0> + b|1> with a = r0 + i*i0, b = r1 + i*i1:
+        // r_x = 2 Re(a* b), r_y = 2 Im(a* b), r_z = |a|^2 - |b|^2.  The
+        // (batch, out_dim, in_dim, 3) output is viewed as (batch, out_dim,
+        // 3 * in_dim); the launcher bounds 3 * out_dim * in_dim to int32.
+        auto gBloch = make_tensor(make_gmem_ptr(out_ptr),
+                        ROWMAJOR3(batch_size, out_dim, 3 * in_dim));
+        gBloch(b, idx_o, 3 * idx_i + 0) = IOT(2.0f * (r0 * r1 + i0 * i1));
+        gBloch(b, idx_o, 3 * idx_i + 1) = IOT(2.0f * (r0 * i1 - i0 * r1));
+        gBloch(b, idx_o, 3 * idx_i + 2) = IOT((r0*r0 + i0*i0) - (r1*r1 + i1*i1));
+        return;
+    }
+
     float result;
     if (fast_measure) result = sqrtf(r0*r0 + i0*i0) - sqrtf(r1*r1 + i1*i1);
     else              result = (r0*r0 + i0*i0) - (r1*r1 + i1*i1);
@@ -235,7 +248,7 @@ __global__ void cute_pz_bwd_kernel(
     float* __restrict__ grad_pw_ptr,
     float* __restrict__ grad_pb_ptr,
     int batch_size, int in_dim, int out_dim, int reps,
-    bool preacts_trainable, bool fast_measure, float fp8_prescale)
+    bool preacts_trainable, bool fast_measure, float fp8_prescale, bool bloch)
 {
     extern __shared__ float smem[];
     constexpr int NUM_WARPS = (BLOCK_B + 31) / 32;
@@ -257,6 +270,10 @@ __global__ void cute_pz_bwd_kernel(
                 ROWMAJOR2(batch_size, in_dim));
     auto gGradOut = make_tensor(make_gmem_ptr(grad_out_ptr),
                       ROWMAJOR3(batch_size, out_dim, in_dim));
+    // Bloch mode: grad_output is (batch, out_dim, in_dim, 3), viewed as
+    // (batch, out_dim, 3 * in_dim); the launcher bounds 3 * out_dim * in_dim.
+    auto gGradBloch = make_tensor(make_gmem_ptr(grad_out_ptr),
+                        ROWMAJOR3(batch_size, out_dim, 3 * in_dim));
     auto gPW = make_tensor(make_gmem_ptr(pw_ptr),
                  ROWMAJOR3(out_dim, in_dim, reps));
     auto gPB = make_tensor(make_gmem_ptr(pb_ptr),
@@ -376,22 +393,35 @@ __global__ void cute_pz_bwd_kernel(
     }
 
     // ── Phase 2: Measurement gradient ──
-    float go = valid ? gGradOut(b, idx_o, idx_i) : 0.0f;
     float ar0, ai0, ar1, ai1;
-    if (fast_measure) {
-        float alpha_norm = sqrtf(r0*r0 + i0*i0);
-        float beta_norm  = sqrtf(r1*r1 + i1*i1);
-        float inv_alpha  = (alpha_norm > 1e-30f) ? 1.0f / alpha_norm : 0.0f;
-        float inv_beta   = (beta_norm  > 1e-30f) ? 1.0f / beta_norm  : 0.0f;
-        ar0 =  go * r0 * inv_alpha;
-        ai0 =  go * i0 * inv_alpha;
-        ar1 = -go * r1 * inv_beta;
-        ai1 = -go * i1 * inv_beta;
+    if (bloch) {
+        // Adjoint of (r_x, r_y, r_z) w.r.t. (r0, i0, r1, i1) for the upstream
+        // gradient (gx, gy, gz); with gx = gy = 0 it is the square-measure
+        // seed below.
+        float gx = valid ? gGradBloch(b, idx_o, 3 * idx_i + 0) : 0.0f;
+        float gy = valid ? gGradBloch(b, idx_o, 3 * idx_i + 1) : 0.0f;
+        float gz = valid ? gGradBloch(b, idx_o, 3 * idx_i + 2) : 0.0f;
+        ar0 = 2.0f * (gx * r1 + gy * i1 + gz * r0);
+        ai0 = 2.0f * (gx * i1 - gy * r1 + gz * i0);
+        ar1 = 2.0f * (gx * r0 - gy * i0 - gz * r1);
+        ai1 = 2.0f * (gx * i0 + gy * r0 - gz * i1);
     } else {
-        ar0 =  2.0f * go * r0;
-        ai0 =  2.0f * go * i0;
-        ar1 = -2.0f * go * r1;
-        ai1 = -2.0f * go * i1;
+        float go = valid ? gGradOut(b, idx_o, idx_i) : 0.0f;
+        if (fast_measure) {
+            float alpha_norm = sqrtf(r0*r0 + i0*i0);
+            float beta_norm  = sqrtf(r1*r1 + i1*i1);
+            float inv_alpha  = (alpha_norm > 1e-30f) ? 1.0f / alpha_norm : 0.0f;
+            float inv_beta   = (beta_norm  > 1e-30f) ? 1.0f / beta_norm  : 0.0f;
+            ar0 =  go * r0 * inv_alpha;
+            ai0 =  go * i0 * inv_alpha;
+            ar1 = -go * r1 * inv_beta;
+            ai1 = -go * i1 * inv_beta;
+        } else {
+            ar0 =  2.0f * go * r0;
+            ai0 =  2.0f * go * i0;
+            ar1 = -2.0f * go * r1;
+            ai1 = -2.0f * go * i1;
+        }
     }
 
     // ── Phase 3: Backward sweep ──
@@ -1286,17 +1316,36 @@ static inline void check_launch_inputs(
 /// The backward kernels also read grad_output, through a (batch, out_dim,
 /// in_dim) view built from x and theta -- so a smaller tensor would be read
 /// past its end, the same way an undersized grad_y would in the activations.
+/// The pz Bloch backward (bloch = true) reads (batch, out_dim, in_dim, 3).
 static inline void check_backward_inputs(
     const torch::Tensor& x, const torch::Tensor& theta,
     const torch::Tensor& pw, const torch::Tensor& pb,
-    const torch::Tensor& grad_output, int reps)
+    const torch::Tensor& grad_output, int reps, bool bloch = false)
 {
     check_launch_inputs(x, theta, pw, pb, reps);
     check_on_device(grad_output, "grad_output", x);
+    if (bloch) {
+        TORCH_CHECK(grad_output.sizes() == torch::IntArrayRef({x.size(0), theta.size(0), x.size(1), 3}),
+            "CuTe solver: grad_output shape ", grad_output.sizes(),
+            " must be (batch, out_dim, in_dim, 3) = (", x.size(0), ", ",
+            theta.size(0), ", ", x.size(1), ", 3)");
+        return;
+    }
     TORCH_CHECK(grad_output.sizes() == torch::IntArrayRef({x.size(0), theta.size(0), x.size(1)}),
         "CuTe solver: grad_output shape ", grad_output.sizes(),
         " must be (batch, out_dim, in_dim) = (", x.size(0), ", ", theta.size(0),
         ", ", x.size(1), ")");
+}
+
+/// The pz Bloch kernels address the (batch, out_dim, in_dim, 3) output and
+/// grad_output through a (batch, out_dim, 3 * in_dim) view whose trailing
+/// offsets are int32: check_launch_inputs bounds out_dim * in_dim, which
+/// leaves the factor of 3 unchecked.
+static inline void check_bloch_extent(const torch::Tensor& x, const torch::Tensor& theta)
+{
+    TORCH_CHECK((int64_t)3 * theta.size(0) * x.size(1) <= std::numeric_limits<int>::max(),
+        "CuTe solver: 3 * out_dim * in_dim = ", (int64_t)3 * theta.size(0) * x.size(1),
+        " exceeds int32 range (pz Bloch output)");
 }
 
 /// Ceil-div of batch into grid.y blocks, in 64-bit on the untruncated
@@ -1327,16 +1376,20 @@ static inline int checked_smem_bytes(int64_t bytes, int reps, c10::DeviceIndex d
 // Python-facing launchers
 // ====================================================================
 
-torch::Tensor cute_pz_forward(
+// bloch = false: the Z measurement, (batch, out_dim, in_dim).
+// bloch = true: the Bloch vectors, (batch, out_dim, in_dim, 3); fast_measure
+// is unused.
+static torch::Tensor pz_forward_impl(
     torch::Tensor x, torch::Tensor theta,
     torch::Tensor pw, torch::Tensor pb,
-    bool preacts_trainable, bool fast_measure, bool use_bf16)
+    bool preacts_trainable, bool fast_measure, bool use_bf16, bool bloch)
 {
     int batch   = x.size(0);
     int in_dim  = x.size(1);
     int out_dim = theta.size(0);
     int reps    = theta.size(2) - 1;
     check_launch_inputs(x, theta, pw, pb, reps);
+    if (bloch) check_bloch_extent(x, theta);
 
     // Guard before allocating: an oversized batch must report the grid limit
     // rather than OOM on the output tensor first.
@@ -1346,8 +1399,10 @@ torch::Tensor cute_pz_forward(
     int smem = checked_smem_bytes((int64_t)(reps + 1) * 2 * 2 * sizeof(float), reps, x.device().index());
 
     auto io_dtype = use_bf16 ? torch::kBFloat16 : torch::kFloat32;
-    auto output = torch::empty({batch, out_dim, in_dim},
-        torch::TensorOptions().device(x.device()).dtype(io_dtype));
+    auto out_opts = torch::TensorOptions().device(x.device()).dtype(io_dtype);
+    auto output = bloch
+        ? torch::empty({batch, out_dim, in_dim, 3}, out_opts)
+        : torch::empty({batch, out_dim, in_dim}, out_opts);
     x     = prep(x, io_dtype);
     theta = prep(theta, io_dtype);
     pw = prep(pw, io_dtype);
@@ -1363,31 +1418,54 @@ torch::Tensor cute_pz_forward(
             reinterpret_cast<const bf16_t*>(pb.data_ptr()),
             reinterpret_cast<bf16_t*>(output.data_ptr()),
             batch, in_dim, out_dim, reps,
-            preacts_trainable, fast_measure);
+            preacts_trainable, fast_measure, bloch);
     } else {
         DISPATCH_FWD(block_b, float, cute_pz_fwd_kernel, grid, smem,
             x.data_ptr<float>(), theta.data_ptr<float>(),
             pw.data_ptr<float>(), pb.data_ptr<float>(),
             output.data_ptr<float>(),
             batch, in_dim, out_dim, reps,
-            preacts_trainable, fast_measure);
+            preacts_trainable, fast_measure, bloch);
     }
 
     return output;
 }
 
-std::vector<torch::Tensor> cute_pz_backward(
+torch::Tensor cute_pz_forward(
+    torch::Tensor x, torch::Tensor theta,
+    torch::Tensor pw, torch::Tensor pb,
+    bool preacts_trainable, bool fast_measure, bool use_bf16)
+{
+    return pz_forward_impl(x, theta, pw, pb,
+        preacts_trainable, fast_measure, use_bf16, /*bloch=*/false);
+}
+
+/// Bloch vectors (r_x, r_y, r_z) of the pz circuits: (batch, out_dim, in_dim, 3).
+torch::Tensor cute_pz_bloch_forward(
+    torch::Tensor x, torch::Tensor theta,
+    torch::Tensor pw, torch::Tensor pb,
+    bool preacts_trainable, bool use_bf16)
+{
+    return pz_forward_impl(x, theta, pw, pb,
+        preacts_trainable, /*fast_measure=*/false, use_bf16, /*bloch=*/true);
+}
+
+// bloch = false: grad_output is (batch, out_dim, in_dim) of the Z measurement.
+// bloch = true: grad_output is (batch, out_dim, in_dim, 3) of the Bloch
+// vectors; fast_measure is unused.
+static std::vector<torch::Tensor> pz_backward_impl(
     torch::Tensor x, torch::Tensor theta,
     torch::Tensor pw, torch::Tensor pb,
     torch::Tensor grad_output,
-    bool preacts_trainable, bool fast_measure, int state_bits)
+    bool preacts_trainable, bool fast_measure, int state_bits, bool bloch)
 {
     // state_bits: 32 = f32 states, 8 = fp8 prescaled, 4 = fp4 prescaled (experimental)
     int batch   = x.size(0);
     int in_dim  = x.size(1);
     int out_dim = theta.size(0);
     int reps    = theta.size(2) - 1;
-    check_backward_inputs(x, theta, pw, pb, grad_output, reps);
+    check_backward_inputs(x, theta, pw, pb, grad_output, reps, bloch);
+    if (bloch) check_bloch_extent(x, theta);
 
     x     = prep(x, torch::kFloat32);
     theta = prep(theta, torch::kFloat32);
@@ -1441,7 +1519,7 @@ std::vector<torch::Tensor> cute_pz_backward(
             grad_theta.data_ptr<float>(), grad_x.data_ptr<float>(),
             grad_pw.data_ptr<float>(), grad_pb.data_ptr<float>(),
             batch, in_dim, out_dim, reps,
-            preacts_trainable, fast_measure, prescale);
+            preacts_trainable, fast_measure, prescale, bloch);
     } else if (state_bits == 16) {
         DISPATCH_BWD(block_b, bf16_t, cute_pz_bwd_kernel, grid, smem,
             x.data_ptr<float>(), theta.data_ptr<float>(),
@@ -1451,7 +1529,7 @@ std::vector<torch::Tensor> cute_pz_backward(
             grad_theta.data_ptr<float>(), grad_x.data_ptr<float>(),
             grad_pw.data_ptr<float>(), grad_pb.data_ptr<float>(),
             batch, in_dim, out_dim, reps,
-            preacts_trainable, fast_measure, prescale);
+            preacts_trainable, fast_measure, prescale, bloch);
     } else {
         DISPATCH_BWD(block_b, float, cute_pz_bwd_kernel, grid, smem,
             x.data_ptr<float>(), theta.data_ptr<float>(),
@@ -1461,12 +1539,34 @@ std::vector<torch::Tensor> cute_pz_backward(
             grad_theta.data_ptr<float>(), grad_x.data_ptr<float>(),
             grad_pw.data_ptr<float>(), grad_pb.data_ptr<float>(),
             batch, in_dim, out_dim, reps,
-            preacts_trainable, fast_measure, prescale);
+            preacts_trainable, fast_measure, prescale, bloch);
     }
 
     return {grad_x, grad_theta,
             preacts_trainable ? grad_pw : torch::Tensor(),
             preacts_trainable ? grad_pb : torch::Tensor()};
+}
+
+std::vector<torch::Tensor> cute_pz_backward(
+    torch::Tensor x, torch::Tensor theta,
+    torch::Tensor pw, torch::Tensor pb,
+    torch::Tensor grad_output,
+    bool preacts_trainable, bool fast_measure, int state_bits)
+{
+    return pz_backward_impl(x, theta, pw, pb, grad_output,
+        preacts_trainable, fast_measure, state_bits, /*bloch=*/false);
+}
+
+/// Backward of cute_pz_bloch_forward for grad_output (batch, out_dim, in_dim, 3):
+/// {grad_x, grad_theta, grad_pw or None, grad_pb or None}, float32.
+std::vector<torch::Tensor> cute_pz_bloch_backward(
+    torch::Tensor x, torch::Tensor theta,
+    torch::Tensor pw, torch::Tensor pb,
+    torch::Tensor grad_output,
+    bool preacts_trainable, int state_bits)
+{
+    return pz_backward_impl(x, theta, pw, pb, grad_output,
+        preacts_trainable, /*fast_measure=*/false, state_bits, /*bloch=*/true);
 }
 
 torch::Tensor cute_rpz_forward(
@@ -1749,6 +1849,10 @@ torch::Tensor cute_activation_backward(torch::Tensor grad_y, torch::Tensor x, in
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pz_forward",    &cute_pz_forward,    "CuTe PZ forward");
     m.def("pz_backward",   &cute_pz_backward,   "CuTe PZ backward");
+    m.def("pz_bloch_forward",  &cute_pz_bloch_forward,
+          "CuTe PZ forward returning Bloch vectors (batch, out_dim, in_dim, 3)");
+    m.def("pz_bloch_backward", &cute_pz_bloch_backward,
+          "CuTe PZ backward for Bloch-vector grad_output (batch, out_dim, in_dim, 3)");
     m.def("rpz_forward",   &cute_rpz_forward,   "CuTe RPZ forward");
     m.def("rpz_backward",  &cute_rpz_backward,  "CuTe RPZ backward");
     m.def("real_forward",  &cute_real_forward,   "CuTe Real forward");

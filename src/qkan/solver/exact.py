@@ -46,11 +46,19 @@ def torch_exact_solver(
             options: ["pz_encoding", "px_encoding"], default: "pz_encoding"
         n_group : int
             number of neurons in a group, default: in_dim of x
+        bloch_measure : bool
+            default: False. If True, return the Bloch vector (r_x, r_y, r_z)
+            of every circuit instead of the Z measurement; ``fast_measure`` is
+            then ignored. Only for ansatz "pz_encoding" / "pz".
 
     Returns
     -------
         torch.Tensor
-            shape: (batch_size, out_dim, in_dim)
+            shape: (batch_size, G, in_dim), or (batch_size, G, in_dim, 3) with
+            bloch_measure=True, in the real dtype of ``dtype``. G =
+            theta.shape[0] after broadcasting: a theta of shape
+            (in_dim, reps + 1, 2) gives G = 1, a theta repeated up to in_dim
+            gives G = out_dim.
     """
     batch, in_dim = x.shape
     device = x.device
@@ -64,6 +72,12 @@ def torch_exact_solver(
     # instead of storing it. Trades ~1 extra forward pass for reps× less
     # rep-state memory. Only meaningful when grad is required.
     checkpoint_reps = kwargs.get("checkpoint_reps", False) and torch.is_grad_enabled()
+    bloch_measure = kwargs.get("bloch_measure", False)
+    if bloch_measure and ansatz not in ("pz_encoding", "pz"):
+        raise NotImplementedError(
+            f"bloch_measure=True is only implemented for ansatz 'pz_encoding' "
+            f"or 'pz', got {ansatz!r}"
+        )
 
     if len(theta.shape) != 4:
         theta = theta.unsqueeze(0)
@@ -131,6 +145,8 @@ def torch_exact_solver(
 
         psi.rz(theta[:, :, reps, 0])
         psi.ry(theta[:, :, reps, 1])
+        if bloch_measure:
+            return psi.measure_bloch()  # shape: (batch_size, out_dim, in_dim, 3)
         return psi.measure_z(fast_measure)  # shape: (batch_size, out_dim, in_dim)
 
     def _rpz_encoding(theta: torch.Tensor):
