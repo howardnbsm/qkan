@@ -431,7 +431,7 @@ if BUILD_CUTE:
 
     nvcc_flags = [
         "-O3",
-        "-std=c++17",
+        "-std=c++20",
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -453,7 +453,7 @@ if BUILD_CUTE:
                 "src/qkan/csrc/cute_linear.cu",
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                "cxx": ["-O3", "-std=c++20"],
                 "nvcc": nvcc_flags + cc_flags,
             },
             include_dirs=[CUTLASS_INC],

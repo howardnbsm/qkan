@@ -103,10 +103,10 @@ def _load_jit():
         name="qkan_cute_ops",
         sources=sources,
         extra_include_paths=[cutlass_inc],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++20"],
         extra_cuda_cflags=[
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "--use_fast_math",
